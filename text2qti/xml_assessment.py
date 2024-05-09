@@ -183,6 +183,33 @@ ITEM_PRESENTATION_NUM = '''\
         </presentation>
 '''
 
+ITEM_PRESENTATION_INLINE = '''\
+        <presentation>
+          <material>
+            <mattext texttype="text/html">{question_html_xml}</mattext>
+          </material>
+{reference_words}
+        </presentation>
+'''
+
+ITEM_PRESENTATION_INLINE_GAPS = '''\
+          <response_lid ident="response_{ref_word}">
+            <material>
+              <mattext>{ref_word}</mattext>
+            </material>
+            <render_choice>
+{choices}
+            </render_choice>
+          </response_lid>
+'''
+
+ITEM_PRESENTATION_INLINE_GAPS_CHOICE = '''\
+              <response_label ident="{ident}">
+                <material>
+                  <mattext texttype="text/html">{choice_html_xml}</mattext>
+                </material>
+              </response_label>'''
+
 
 ITEM_RESPROCESSING_START = '''\
         <resprocessing>
@@ -378,11 +405,27 @@ ITEM_RESPROCESSING_ESSAY = '''\
 '''
 
 
+ITEM_RESPROCESSING_INLINE_FEEDBACK = '''\
+          <respcondition continue="Yes">
+            <conditionvar>
+              <varequal respident="response_{gap}">{ident}</varequal>
+            </conditionvar>
+            <displayfeedback feedbacktype="Response" linkrefid="{ident}_fb"/>
+          </respcondition>
+'''
+
+ITEM_RESPROCESSING_INLINE_ADD_CORRECT_CHOICE = '''\
+          <respcondition>
+            <conditionvar>
+              <varequal respident="response_{gap}">{ident}</varequal>
+            </conditionvar>
+            <setvar varname="SCORE" action="Add">{score}</setvar>
+          </respcondition>
+'''
 
 ITEM_RESPROCESSING_END = '''\
         </resprocessing>
 '''
-
 
 ITEM_FEEDBACK_MCTF_SHORTANS_MULTANS_NUM_GENERAL = '''\
         <itemfeedback ident="general_fb">
@@ -423,8 +466,6 @@ ITEM_FEEDBACK_MCTF_SHORTANS_MULTANS_NUM_INDIVIDUAL = '''\
           </flow_mat>
         </itemfeedback>
 '''
-
-
 
 
 def assessment(*, quiz: Quiz, assessment_identifier: str, title_xml: str) -> str:
@@ -477,7 +518,8 @@ def assessment(*, quiz: Quiz, assessment_identifier: str, title_xml: str) -> str
                                         original_answer_ids=original_answer_ids,
                                         assessment_question_identifierref=f'text2qti_question_ref_{question.id}'))
 
-        if question.type in ('true_false_question', 'multiple_choice_question', 'multiple_answers_question'):
+        if question.type in ('true_false_question', 'multiple_choice_question', 'multiple_answers_question',
+                             'inline_choice_question', 'text_entry_question'):
             if question.type in ('true_false_question', 'multiple_choice_question'):
                 item_presentation_choice = ITEM_PRESENTATION_MCTF_CHOICE
                 item_presentation = ITEM_PRESENTATION_MCTF
@@ -487,7 +529,7 @@ def assessment(*, quiz: Quiz, assessment_identifier: str, title_xml: str) -> str
             else:
                 raise ValueError
             choices = '\n'.join(item_presentation_choice.format(ident=f'text2qti_choice_{c.id}', choice_html_xml=c.choice_html_xml)
-                                                                for c in question.choices)
+                                for c in question.choices)
             xml.append(item_presentation.format(question_html_xml=question.question_html_xml, choices=choices))
         elif question.type == 'short_answer_question':
             xml.append(ITEM_PRESENTATION_SHORTANS.format(question_html_xml=question.question_html_xml))
@@ -497,6 +539,23 @@ def assessment(*, quiz: Quiz, assessment_identifier: str, title_xml: str) -> str
             xml.append(ITEM_PRESENTATION_ESSAY.format(question_html_xml=question.question_html_xml))
         elif question.type == 'file_upload_question':
             xml.append(ITEM_PRESENTATION_UPLOAD.format(question_html_xml=question.question_html_xml))
+        elif question.type in ('inline_choice_question', 'text_entry_question'):
+            item_presentation_gaps_list = []
+            for gap in question.gaps:
+                item_presentation_gap = ITEM_PRESENTATION_INLINE_GAPS
+                gap_choice_set = set()
+                for choice in question.choices:
+                    if choice.gap == gap:
+                        gap_choice_set.add(choice)
+                item_presentation_fimb_reference_words_choice = ITEM_PRESENTATION_INLINE_GAPS_CHOICE
+                choices = '\n'.join(item_presentation_fimb_reference_words_choice.format(ident=f'text2qti_choice_{c.id}', choice_html_xml=c.choice_xml)
+                                    for c in gap_choice_set)
+
+                item_presentation_gap = item_presentation_gap.format(gap=gap, choices=choices)
+                item_presentation_gaps_list.append(item_presentation_gap)
+
+            item_presentation_reference_words_str = '\n'.join(item_presentation_gaps_list)
+            xml.append(ITEM_PRESENTATION_INLINE.format(question_html_xml=question.question_html_xml, reference_words=item_presentation_reference_words_str))
         else:
             raise ValueError
 
@@ -504,8 +563,8 @@ def assessment(*, quiz: Quiz, assessment_identifier: str, title_xml: str) -> str
             correct_choice = None
             for choice in question.choices:
                 if choice.correct:
-                  correct_choice = choice
-                  break
+                    correct_choice = choice
+                    break
             if correct_choice is None:
                 raise TypeError
             resprocessing = []
@@ -567,7 +626,7 @@ def assessment(*, quiz: Quiz, assessment_identifier: str, title_xml: str) -> str
         elif question.type == 'numerical_question':
             xml.append(ITEM_RESPROCESSING_START)
             if question.feedback_raw is not None:
-              xml.append(ITEM_RESPROCESSING_NUM_GENERAL_FEEDBACK)
+                xml.append(ITEM_RESPROCESSING_NUM_GENERAL_FEEDBACK)
             if question.correct_feedback_raw is None:
                 if question.numerical_exact is None:
                     item_resprocessing_num_set_correct = ITEM_RESPROCESSING_NUM_RANGE_SET_CORRECT_NO_FEEDBACK
@@ -595,12 +654,27 @@ def assessment(*, quiz: Quiz, assessment_identifier: str, title_xml: str) -> str
             if question.feedback_raw is not None:
                 xml.append(ITEM_RESPROCESSING_UPLOAD_GENERAL_FEEDBACK)
             xml.append(ITEM_RESPROCESSING_END)
+        elif question.type in ('inline_choice_question', 'text_entry_question'):
+            resprocessing = []
+            resprocessing.append(ITEM_RESPROCESSING_START)
+            per_ref_word_score_str = '%.2f' % (100/question.num_reference_words)
+            if question.feedback_raw is not None:
+                resprocessing.append(ITEM_RESPROCESSING_MCTF_GENERAL_FEEDBACK)
+            for choice in question.choices:
+                if choice.feedback_raw is not None:
+                    resprocessing.append(ITEM_RESPROCESSING_INLINE_FEEDBACK.format(ref_word=choice.reference_word, ident=f'text2qti_choice_{choice.id}'))
+            for choice in question.choices:
+                if choice.correct:
+                    resprocessing.append(ITEM_RESPROCESSING_INLINE_ADD_CORRECT_CHOICE.format(ref_word=choice.reference_word, ident=f'text2qti_choice_{choice.id}', score=per_ref_word_score_str))
+            resprocessing.append(ITEM_RESPROCESSING_END)
+            xml.extend(resprocessing)
         else:
             raise ValueError
 
         if question.type in ('true_false_question', 'multiple_choice_question',
                              'short_answer_question', 'multiple_answers_question',
-                             'numerical_question', 'essay_question', 'file_upload_question'):
+                             'numerical_question', 'essay_question', 'file_upload_question'
+                             'inline_choice_question', 'text_entry_question'):
             if question.feedback_raw is not None:
                 xml.append(ITEM_FEEDBACK_MCTF_SHORTANS_MULTANS_NUM_GENERAL.format(feedback=question.feedback_html_xml))
             if question.correct_feedback_raw is not None:
@@ -608,7 +682,8 @@ def assessment(*, quiz: Quiz, assessment_identifier: str, title_xml: str) -> str
             if question.incorrect_feedback_raw is not None:
                 xml.append(ITEM_FEEDBACK_MCTF_SHORTANS_MULTANS_NUM_INCORRECT.format(feedback=question.incorrect_feedback_html_xml))
         if question.type in ('true_false_question', 'multiple_choice_question',
-                             'short_answer_question', 'multiple_answers_question'):
+                             'short_answer_question', 'multiple_answers_question',
+                             'inline_choice_question', 'text_entry_question'):
             for choice in question.choices:
                 if choice.feedback_raw is not None:
                     xml.append(ITEM_FEEDBACK_MCTF_SHORTANS_MULTANS_NUM_INDIVIDUAL.format(ident=f'text2qti_choice_{choice.id}',

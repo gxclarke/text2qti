@@ -8,10 +8,10 @@
 #
 
 
-'''
+"""
 Parse text into a Quiz object that contains a list of Question objects, each
 of which contains a list of Choice objects.
-'''
+"""
 
 
 import hashlib
@@ -28,8 +28,6 @@ from typing import Dict, List, Optional, Set, Union
 from .config import Config
 from .err import Text2qtiError
 from .markdown import Image, Markdown
-
-
 
 
 # regex patterns for parsing quiz content
@@ -67,6 +65,7 @@ start_patterns = {
     'quiz_feedback_is_solution': r'[Ff]eedback is solution:',
     'quiz_solutions_sample_groups': r'[Ss]olutions sample groups:',
     'quiz_solutions_randomize_groups': r'[Ss]olutions randomize groups:',
+    'gap': r'{{.+}}',
 }
 # comments are currently handled separately from content
 comment_patterns = {
@@ -75,7 +74,7 @@ comment_patterns = {
     'line_comment': r'%',
 }
 # whether regex needs to check after pattern for content on the same line
-no_content = set(['essay', 'upload', 'start_group', 'end_group', 'start_code', 'end_code'])
+no_content = set(['essay', 'upload', 'start_group', 'end_group', 'start_code', 'end_code', 'gap'])
 # whether parser needs to check for multi-line content
 single_line = set(['question_points', 'group_pick', 'group_solutions_pick', 'group_points_per_question',
                    'numerical', 'shortans_correct_choice',
@@ -86,6 +85,8 @@ multi_line = set([x for x in start_patterns
                   if x not in no_content and x not in single_line])
 # whether parser needs to check for multi-paragraph content
 multi_para = set([x for x in multi_line if 'title' not in x])
+# whether question has gaps that need to be filled in
+question_has_gaps_re = re.compile(r'\{\{[^{]*}}')
 start_re = re.compile('|'.join(r'(?P<{0}>{1}[ \t]+(?=\S))'.format(name, pattern)
                                if name not in no_content else
                                r'(?P<{0}>{1}\s*)$'.format(name, pattern)
@@ -103,14 +104,13 @@ start_code_supported_info_re = re.compile(r'\{\s*'
                                           r'(?:\s+executable=(?P<executable>[~\w/\.\-]+|"[^\\\"\']+"))?'
                                           r'\s*\}$')
 int_re = re.compile('(?:0|[+-]?[1-9](?:[0-9]+|_[0-9]+)*)$')
-
-
+gap_re = re.compile(r'\{\{[^{]*}}')
 
 
 class TextRegion(object):
-    '''
+    """
     A text region between questions.
-    '''
+    """
     def __init__(self, *, index: int, md: Markdown):
         self.title_raw: Optional[str] = None
         self.title_xml = ''
@@ -145,30 +145,30 @@ class TextRegion(object):
         self._set_id()
 
 
-
-
 class Choice(object):
-    '''
+    """
     A choice for a question plus optional feedback.
 
     The id is based on a hash of both the question and the choice itself.
     The presence of feedback does not affect the id.
-    '''
+    """
     def __init__(self, text: str, *,
-                 correct: bool, shortans: bool=False,
-                 question_hash_digest: bytes, md: Markdown):
+                 correct: bool, plain_text: bool = False,
+                 question_hash_digest: bytes, md: Markdown,
+                 gap_word=None):
         self.choice_raw = text
-        if shortans:
+        if plain_text:
             self.choice_xml = md.xml_escape(text)
         else:
             self.choice_html_xml = md.md_to_html_xml(text)
         self.correct = correct
-        self.shortans = shortans
+        self.plain_text = plain_text
         self.feedback_raw: Optional[str] = None
         self.feedback_html_xml: Optional[str] = None
+        self.gap_word = gap_word
         # ID is based on hash of choice XML as well as question XML.  This
         # gives different IDs for identical choices in different questions.
-        if shortans:
+        if plain_text:
             self.id = hashlib.blake2b(self.choice_xml.encode('utf8'), key=question_hash_digest).hexdigest()[:64]
         else:
             self.id = hashlib.blake2b(self.choice_html_xml.encode('utf8'), key=question_hash_digest).hexdigest()[:64]
@@ -184,10 +184,10 @@ class Choice(object):
 
 
 class Question(object):
-    '''
+    """
     A question, along with a list of possible choices and optional feedback of
     various types.
-    '''
+    """
     def __init__(self, text: str, *, quiz: 'Quiz', title: Optional[str], points: Optional[str], md: Markdown):
         # Question type is set once it is known.  For true/false or multiple
         # choice, this is done during .finalize(), once all choices are
@@ -216,6 +216,27 @@ class Question(object):
         self.numerical_max: Optional[Union[int, float]] = None
         self.numerical_max_html_xml: Optional[str] = None
         self.correct_choices = 0
+        self.current_gap = None
+        # Detecting if the question is text entry or inline choice
+        self.gaps_raw = None
+        self.gaps = None
+        self.num_gaps = 0
+        gaps_raw = question_has_gaps_re.findall(text)
+        if gaps_raw is not None:
+            self.gaps = set()
+            for gap_raw in gaps_raw:
+                # For each reference word found:
+                # 1. Strip the the (double) curly braces and save
+                gap = gap_raw.lstrip('{}').rstrip('}')
+                if gap in self.gaps:
+                    raise Text2qtiError('Cannot have duplicated gap names in the same question')
+                else:
+                    self.gaps.add(gap)
+                    # 2. Surround with brackets to match the gap format on Canvas
+                    gap_in_html_xml = '[' + gap + ']'
+                    text = text.replace(gap_raw, gap_in_html_xml)
+                    self.num_gaps += 1
+        self.gap_word = None # TODO: Need to implement this
         if points is None:
             self.points_possible_raw: Optional[str] = None
             self.points_possible: Union[int, float] = 1
@@ -243,7 +264,6 @@ class Question(object):
         self.hash_digest = h.digest()
         self.id = h.hexdigest()[:64]
         self.md = md
-
 
     def append_feedback(self, text: str):
         if self.type is not None and not self.choices:
@@ -288,7 +308,7 @@ class Question(object):
             self.type = 'multiple_choice_question'
         elif self.type != 'multiple_choice_question':
             raise Text2qtiError(f'Question type "{self.type}" does not support multiple choice')
-        choice = Choice(text, correct=True, question_hash_digest=self.hash_digest, md=self.md)
+        choice = Choice(text, correct=True, question_hash_digest=self.hash_digest, md=self.md, gap_word=self.gap_word)
         if choice.choice_html_xml in self._choice_set:
             raise Text2qtiError('Duplicate choice for question')
         self._choice_set.add(choice.choice_html_xml)
@@ -300,7 +320,7 @@ class Question(object):
             self.type = 'multiple_choice_question'
         elif self.type != 'multiple_choice_question':
             raise Text2qtiError(f'Question type "{self.type}" does not support multiple choice')
-        choice = Choice(text, correct=False, question_hash_digest=self.hash_digest, md=self.md)
+        choice = Choice(text, correct=False, question_hash_digest=self.hash_digest, md=self.md, gap_word=self.gap_word)
         if choice.choice_html_xml in self._choice_set:
             raise Text2qtiError('Duplicate choice for question')
         self._choice_set.add(choice.choice_html_xml)
@@ -348,7 +368,7 @@ class Question(object):
             raise ValueError
         if self.type is not None:
             if self.type == 'essay_question':
-                raise Text2qtiError(f'Cannot specify essay response multiple times')
+                raise Text2qtiError('Cannot specify essay response multiple times')
             raise Text2qtiError(f'Question type "{self.type}" does not support essay response')
         self.type = 'essay_question'
         if any(x is not None for x in (self.correct_feedback_raw, self.incorrect_feedback_raw)):
@@ -361,7 +381,7 @@ class Question(object):
             raise ValueError
         if self.type is not None:
             if self.type == 'file_upload_question':
-                raise Text2qtiError(f'Cannot specify upload response multiple times')
+                raise Text2qtiError('Cannot specify upload response multiple times')
             raise Text2qtiError(f'Question type "{self.type}" does not support upload response')
         self.type = 'file_upload_question'
         if any(x is not None for x in (self.correct_feedback_raw, self.incorrect_feedback_raw)):
@@ -370,7 +390,7 @@ class Question(object):
     def append_numerical(self, text: str):
         if self.type is not None:
             if self.type == 'numerical_question':
-                raise Text2qtiError(f'Cannot specify numerical response multiple times')
+                raise Text2qtiError('Cannot specify numerical response multiple times')
             raise Text2qtiError(f'Question type "{self.type}" does not support numerical response')
         self.type = 'numerical_question'
         self.numerical_raw = text
@@ -438,6 +458,78 @@ class Question(object):
         if abs(min) < 1e-4 or abs(max) < 1e-4:
             raise Text2qtiError('Invalid numerical response; all acceptable values must have a magnitude >= 0.0001')
 
+    def append_gap(self, text: str):
+        gap_match = gap_re.match(text)
+        if gap_match is None:
+            raise Text2qtiError('The answer of inline choice question must has gap surrounded by {{ }}')
+        if len(gap_match.group(0)) <= 4:  # if gap is empty: []
+            raise Text2qtiError('Gap cannot be empty in answer of inline choice question')
+        gap_str = gap_match.group(0)[2:-2]
+        set.current_gap = gap_str
+
+    """
+    def ___append_inline_choice(self, text: str, correct: bool):
+        if self.type is None:
+            self.type = 'inline_choice_question'
+            if self.choices:
+                raise Text2qtiError(f'Question type "{self.type}" is not compatible with existing choices')
+        elif self.type != 'inline_choice_question':
+            raise Text2qtiError(f'Question type "{self.type}" does not support short answer')
+
+        gap_match = gap_re.match(text)
+        if gap_match is None:
+            raise Text2qtiError('The answer of inline choice question must has gap surrounded by {{ }}')
+        if len(gap_match.group(0)) <= 4:  # if gap is empty: []
+            raise Text2qtiError('Gap cannot be empty in answer of inline choice question')
+        gap_str = gap_match.group(0)[2:-2]
+        text = text[gap_match.end():].strip()
+
+        choice = Choice(text,
+                        correct=correct,
+                        text_ans=True,
+                        question_hash_digest=self.hash_digest,
+                        md=self.md,
+                        gap=gap_str)
+        if choice.choice_xml in self._choice_set:
+            raise Text2qtiError('Duplicate choice for question')
+        self._choice_set.add(choice.choice_xml)
+        self.choices.append(choice)
+        self.correct_choices += 1
+
+    def ___append_inline_correct_choice(self, text: str):
+        self.___append_inline_choice(self, text, True)
+
+    def ___append_inline_incorrect_choice(self, text: str):
+        self.___append_inline_choice(self, text, False)
+
+    def ___append_text_entry(self, text: str):
+        if self.type is None:
+            self.type = 'text_entry_question'
+            if self.choices:
+                raise Text2qtiError(f'Question type "{self.type}" is not compatible with existing choices')
+        elif self.type != 'text_entry_question':
+            raise Text2qtiError(f'Question type "{self.type}" does not support short answer')
+
+        gap_match = gap_re.match(text)
+        if gap_match is None:
+            raise Text2qtiError('The answer of inline text question must has gap surrounded by {{ }}')
+        if len(gap_match.group(0)) <= 4:  # if gap is empty: []
+            raise Text2qtiError('Gap cannot be empty in answer of inline text question')
+        gap_str = gap_match.group(0)[2:-2]
+        text = text[gap_match.end():].strip()
+
+        choice = Choice(text,
+                        correct=True,
+                        plain_text=True,
+                        question_hash_digest=self.hash_digest,
+                        md=self.md,
+                        gap=gap_str)
+        if choice.choice_xml in self._choice_set:
+            raise Text2qtiError('Duplicate choice for question')
+        self._choice_set.add(choice.choice_xml)
+        self.choices.append(choice)
+        self.correct_choices += 1
+    """
 
     def finalize(self):
         if self.type is None:
@@ -461,15 +553,23 @@ class Question(object):
                 raise Text2qtiError('Question must provide more than one choice')
             if self.correct_choices < 1:
                 raise Text2qtiError('Question must specify a correct choice')
-
-
+        elif self.type == 'inline_choice_question':
+            # For each gap in the question, there must be at least one answer for the gap
+            ref_gap_check_set_from_choices = set()
+            for choice in self.choices:
+                gap = choice.gap
+                if gap not in self.gaps:
+                    raise Text2qtiError('Gap in the answer is not found in the question')
+                ref_gap_check_set_from_choices.add(gap)
+            if ref_gap_check_set_from_choices != self.gaps:
+                raise Text2qtiError('All gaps in the question must have at least one corresponding answer')
 
 
 class Group(object):
-    '''
+    """
     A group of questions.  A random subset of the questions in a group is
     actually displayed.
-    '''
+    """
     def __init__(self):
         self.pick = 1
         self._pick_is_set = False
@@ -520,7 +620,7 @@ class Group(object):
         except Exception as e:
             raise Text2qtiError(f'"Points per question" value is invalid (must be positive number):\n{e}')
         if self.points_per_question <= 0:
-            raise Text2qtiError(f'"Points per question" value is invalid (must be positive number):')
+            raise Text2qtiError('"Points per question" value is invalid (must be positive number):')
         self._points_per_question_is_set = True
 
     def append_question(self, question: Question):
@@ -541,31 +641,31 @@ class Group(object):
         self.hash_digest = h.digest()
         self.id = h.hexdigest()[:64]
 
+
 class GroupStart(object):
-    '''
+    """
     Start delim for a group of questions.
-    '''
+    """
     def __init__(self, group: Group):
         self.group = group
+
 
 class GroupEnd(object):
-    '''
+    """
     End delim for a group of questions.
-    '''
+    """
     def __init__(self, group: Group):
         self.group = group
-
-
 
 
 class Quiz(object):
-    '''
+    """
     A quiz or assessment.  Contains a list of questions along with possible
     choices and feedback.
-    '''
+    """
     def __init__(self, string: str, *, config: Config,
-                 source_name: Optional[str]=None,
-                 resource_path: Optional[Union[str, pathlib.Path]]=None):
+                 source_name: Optional[str] = None,
+                 resource_path: Optional[Union[str, pathlib.Path]] = None):
         self.string = string
         self.config = config
         self.source_name = '<string>' if source_name is None else f'"{source_name}"'
@@ -1184,3 +1284,14 @@ class Quiz(object):
             if match:
                 raise Text2qtiError(f'Missing content after "{match.group().strip()}"')
             raise Text2qtiError(f'Syntax error; unexpected text, or incorrect indentation for a wrapped paragraph:\n"{text}"')
+
+    def append_gap(self, text: str):
+        if self._next_question_attr:
+            raise Text2qtiError('Expected question; question title and/or points were set but not used')
+        if not self.questions_and_delims:
+            raise Text2qtiError('Cannot have a gap without a question')
+        last_question_or_delim = self.questions_and_delims[-1]
+        if not isinstance(last_question_or_delim, Question):
+            raise Text2qtiError('Cannot have a gap without a question')
+        last_question_or_delim.append_gap(text)
+
